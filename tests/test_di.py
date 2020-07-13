@@ -1,8 +1,11 @@
 """
 Dependency injection of CLI arguments
 """
-
+import bisect
+import functools
 import inspect
+import itertools
+import operator
 import typing
 
 import attr
@@ -11,20 +14,13 @@ import typing_inspect
 
 
 @attr.s
-class Match:
-    """A Match is a sequence of command line arguments."""
-
-    types: typing.Dict[str, typing.Type] = {}
-
-    def __init_subclass__(cls, *args, **kwargs):
-        # only collect Matches, which are implemented
-        if cls.serialize is not None:
-            cls.types[cls.__name__] = cls
+class Option:
+    """A Option is a sequence of command line arguments bound to a starter mark."""
 
     marks: typing.Tuple[str, ...] = ()
     serialize: typing.Optional[typing.Callable] = None
     nargs: typing.Union[int, bool] = 0
-    dependencies: typing.Dict[str, typing.Type["Match"]] = {}
+    dependencies: typing.Dict[str, typing.Type["Option"]] = {}
 
     value: typing.Any = attr.ib()
 
@@ -44,7 +40,7 @@ class Match:
                 nargs = True
             elif p.kind is t.VAR_KEYWORD:
                 raise SyntaxError(
-                    f"Variable keyword argument makes no sense for a `Match`: {name}",
+                    f"Variable keyword argument makes no sense for a `Option`: {name}",
                     sig,
                     serialize,
                 )
@@ -52,8 +48,10 @@ class Match:
                 dependencies[name] = p
 
         # we decrease for the fact, that we require cls as the first argument
-        nargs -= 1
+        if nargs is not True:
+            nargs -= 1
         if nargs == 0:
+            breakpoint()  # XXX BREAKPOINT
             raise SyntaxError(
                 (
                     "You need to define at least two positional arguments"
@@ -64,15 +62,6 @@ class Match:
             )
 
         return nargs, dependencies
-
-    @classmethod
-    def options(cls):
-        def _():
-            for option in cls.types.values():
-                for mark in option.marks:
-                    yield mark, option
-
-        return sorted(_())
 
     @classmethod
     def make(cls, *marks: str, help: str = None):
@@ -94,7 +83,7 @@ class Match:
 
     @classmethod
     def consume(cls, *args):
-        if not any(mark.startswith(args[0]) for mark in cls.marks):
+        if not any(map(functools.partial(operator.eq, args[0]), cls.marks)):
             return (), args
         if cls.nargs is True:
             return args, ()
@@ -103,40 +92,61 @@ class Match:
 
 
 @attr.s
-class Option(Match, skip=True):
-    @classmethod
-    def match(cls, *arguments):
-        # we sort our options by marks
-        options = cls.options()
-        mismatched: typing.Dict[typing.Tuple, typing.Set] = {}
-        consumed = {}
-        remaining = []
+class Parser:
+    options: typing.List[typing.Tuple[str, Option]] = attr.ib(factory=list)
+
+    def add(self, option: Option, *options: Option):
+        # add all marks sorted
+        # XXX does it make sense to sort???
+        # we could use a dict or a set to avoid lookup for duplicates
+        for m in itertools.chain((option,), options):
+            for mark in m.marks:
+                bisect.insort(self.options, (mark, m))
+
+    def match(self, *arguments):
+        options = self.options
+        consumed: typing.Dict[Option, typing.List[typing.Tuple[str, ...]]] = {}
+        remaining: typing.List[str] = []
+        failed: typing.Dict[typing.Tuple, typing.Set] = {}
 
         while arguments:
-            marks, option_cls = options.pop(0)
+            mark, option_cls = options.pop(0)
 
             # we already tried this combination
-            if arguments in mismatched and marks in mismatched[arguments]:
+            if arguments in failed and mark in failed[arguments]:
                 remaining.append(arguments[0])
                 arguments = arguments[1:]
-                # reset option
-                options.append((marks, option_cls))
-                continue
-
-            # skip already consumed options
-            if option_cls in consumed:
-                continue
-
-            consumed_arguments, arguments = option_cls.consume(*arguments)
-            if consumed_arguments:
-                consumed[option_cls] = consumed_arguments
             else:
-                # reset option
-                options.append((marks, option_cls))
-                # remember failed option for arguments
-                mismatched.setdefault(arguments, set()).add(marks)
+                consumed_arguments, arguments = option_cls.consume(*arguments)
+                if consumed_arguments:
+                    consumed.setdefault(option_cls, list()).append(consumed_arguments)
+                else:
+                    # remember failed option for arguments
+                    failed.setdefault(arguments, set()).add(mark)
 
+            # reset option
+            options.append((mark, option_cls))
         return consumed, remaining
+
+
+@attr.s
+class CommandLine:
+    parser: Parser = attr.ib(factory=Parser)
+
+    def add(self, option: Option):
+        self.parser.add(option)
+        return option
+
+    def __call__(self, *args):
+        # search for Option dependencies in the parser
+
+        consumed = {
+            option_cls: list(map(operator.itemgetter(1), group))
+            for option_cls, group in itertools.groupby(
+                self.parser.match(*args), operator.itemgetter(0)
+            )
+        }
+        return consumed
 
 
 @Option.make("-c", "--config")
@@ -153,28 +163,33 @@ def Path(cls, _, path: str):
     return cls(value=pathlib.Path(path))
 
 
-@Match.make("--debug")
+@Option.make("--debug")
 def Debug(cls, _: str):
     "Enable debug."
     return cls(True)
 
 
-@Match.make("--de")
+@Option.make("--de")
 def De(cls, argument: str):
     "Enable debug."
     return cls(True)
 
 
-@Match.make("-vvvvv")
+@Option.make("-v", "-vv", "-vvv")
 def Verbose(cls, argument: str):
     "Enable verbosity."
     return cls(True)
 
 
-@Match.make("-h", "--help")
+@Option.make("-h", "--help")
 def Help(cls, argument: str):
     "Show help."
     return cls(True)
+
+
+@Option.make("--")
+def Rest(cls, *args):
+    return
 
 
 ##################################################
@@ -188,7 +203,7 @@ def Help(cls, argument: str):
     ],
 )
 def test_match_consume(args, consumed, rest):
-    @Match.make("-f", "--foo")
+    @Option.make("-f", "--foo")
     def Foo(cls, mark):
         return True
 
@@ -201,11 +216,10 @@ def test_option_make():
         "Foobar."
         return cls(True)
 
-    assert issubclass(Foo, Match)
     assert issubclass(Foo, Option)
 
 
-def test_option_consume():
+def test_command_line_consume():
     args = [
         "-c",
         "config.toml",
@@ -221,13 +235,20 @@ def test_option_consume():
         "-h",
         "--version",
         "-V",
+        "--",
+        "foo",
+        "bar",
     ]
-    consumed, remaining = Option.match(*args)
+    parser = Parser()
+    parser.add(ConfigFile, Verbose, Debug, Help, Path, Rest)
+
+    consumed, remaining = parser.match(*args)
     assert consumed == {
-        ConfigFile: ("-c", "config.toml"),
-        Verbose: ("-vvv",),
-        Debug: ("--debug",),
-        Help: ("--help",),
+        ConfigFile: [("-c", "config.toml")],
+        Verbose: [("-vvv",)],
+        Debug: [("--debug",)],
+        Help: [("--help",), ("-h",)],
+        Rest: [("--", "foo", "bar")],
     }
     assert remaining == [
         "serve",
@@ -236,8 +257,6 @@ def test_option_consume():
         "uvloop",
         "-ca",
         "foobar",
-        # XXX remove -h
-        "-h",
         "--version",
         "-V",
     ]
