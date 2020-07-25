@@ -1,6 +1,6 @@
 import pathlib
 
-from . import Option, Match
+from . import Option, Parser
 
 
 @Option.make("-c", "--config", eager=True)
@@ -35,9 +35,10 @@ class Help(
     """Describe available options and their impact."""
 
     @classmethod
-    def inject(cls, match: Match):
-        options = []
-        # collect all registered option hekp sections
+    def inject(cls, parser: Parser):
+        options = list(parser.generate_all_options())
+        breakpoint()  # XXX BREAKPOINT
+        # collect all registered option help sections
 
         # get the widest marks to define left column width
         # we calculate the golden cut for the left column

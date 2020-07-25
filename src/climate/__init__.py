@@ -125,6 +125,74 @@ class Match:
             self.consumed.setdefault(option_cls, []).extend(consumed)
 
 
+@attr.s
+class Parser(Match):
+    # order defines the order of help
+    option_marks: typing.List[typing.Tuple[typing.Optional[str], OptionType]] = attr.ib(
+        factory=list
+    )
+
+    @property
+    def options(self):
+        return {option_cls for _, option_cls in self.option_marks}
+
+    def add(self, *options: OptionType):
+        for option_cls in options:
+            # for mark in option_cls.marks:
+            #     option_mark = (mark, option_cls)
+            #     if option_mark not in self.option_marks:
+            self.option_marks.extend(
+                option_mark
+                for option_mark in option_cls.option_marks()
+                if option_mark not in self.option_marks
+            )
+
+    def match(self, *arguments: str):
+        while arguments:
+            option_marks = list(self.option_marks)
+            while option_marks:
+                mark, option_cls = option_marks.pop(0)
+                # add dependencies
+                # this is more expensive than loading dependencies when adding options,
+                # but we keep a clean list of user provided options in self.option_marks
+                option_marks.extend(option_cls.all_dependencies())
+
+                match = option_cls.consume(*arguments)
+                if match.consumed:
+                    self.join(match)
+                    arguments = match.remaining
+                    if option_cls.eager:
+                        option_cls.inject(self)
+                    break
+            else:
+                self.remaining.append(arguments[0])
+                arguments = arguments[1:]
+
+    def generate_all_options(self):
+        options = set(self.option_marks)
+        for _, option_cls in list(options):
+            options.update(
+                itertools.chain(
+                    *(o.option_marks() for _, o in option_cls.all_dependencies())
+                )
+            )
+
+        breakpoint()  # XXX BREAKPOINT
+        # for option_cls in
+
+
+@attr.s
+class CommandLine(Parser):
+    def interpret(self, args: typing.List[str] = sys.argv[1:]):
+        self.match(*args)
+        # run exclusive option
+        exclusive = next((o for o in self.options if o.exclusive), None)
+        if exclusive:
+            return {exclusive: exclusive.inject(self)}
+
+        return {option_cls: option_cls.inject(self) for option_cls in self.options}
+
+
 predicates = ("default", "particular", "eager", "exclusive")
 
 
@@ -171,6 +239,11 @@ class Option:
             cls.dependencies = {}
 
     @classmethod
+    def option_marks(cls):
+        for mark in cls.marks:
+            yield (mark, cls)
+
+    @classmethod
     def make(
         cls,
         *marks: str,
@@ -211,32 +284,41 @@ class Option:
         return match
 
     @classmethod
-    def inject(cls, match: Match):
-        if cls in match.values:
-            return match.values[cls]
+    def inject(cls, parser: Parser):
+        if cls in parser.values:
+            return parser.values[cls]
 
         # every Option needs consumed arguments or a default
-        if cls not in match.option_args:
+        if cls not in parser.option_args:
             if cls.default is missing:
                 raise MissingOption(cls)
 
-            value = match.values[cls] = cls(
+            value = parser.values[cls] = cls(
                 cls.default(cls) if callable(cls.default) else cls.default
             )
             return value
 
         if not cls.dependencies:
-            value = match.values[cls] = cls(cls.serialize(*match.option_args[cls]))
+            value = parser.values[cls] = cls(cls.serialize(*parser.option_args[cls]))
             return value
 
         dependencies = {
-            name: dep.inject(match) for name, dep in cls.dependencies.items()
+            name: dep.inject(parser) for name, dep in cls.dependencies.items()
         }
 
-        value = match.values[cls] = cls(
-            cls.serialize(*match.option_args[cls], **dependencies)
+        value = parser.values[cls] = cls(
+            cls.serialize(*parser.option_args[cls], **dependencies)
         )
         return value
+
+    @classmethod
+    def all_dependencies(cls):
+        dependencies = set()
+        for option_cls in cls.dependencies.values():
+            dependencies.update(option_cls.all_dependencies())
+            yield from option_cls.all_dependencies()
+            for mark in option_cls.marks:
+                yield mark, option_cls
 
     @classmethod
     def generate_help(cls):
@@ -317,54 +399,6 @@ class Sections:
 
 
 @attr.s
-class Parser(Match):
-    # order defines the order of help
-    option_marks: typing.List[typing.Tuple[typing.Optional[str], OptionType]] = attr.ib(
-        factory=list
-    )
-
-    @property
-    def options(self):
-        return {option_cls for _, option_cls in self.option_marks}
-
-    def add(self, *options: OptionType):
-        for option_cls in options:
-            for mark in option_cls.marks:
-                self.option_marks.append((mark, option_cls))
-            # also add dependencies
-            # XXX enable backstacking and dependency loading while matching
-            if option_cls.dependencies:
-                self.add(*option_cls.dependencies.values(),)
-
-    def match(self, *arguments: str):
-        while arguments:
-            for mark, option_cls in self.option_marks:
-                match = option_cls.consume(*arguments)
-                if match.consumed:
-                    self.join(match)
-                    arguments = match.remaining
-                    if option_cls.eager:
-                        option_cls.inject(self)
-                    break
-            else:
-                # XXX TODO enable backstaking and duplicate reqcognition
-                self.remaining.append(arguments[0])
-                arguments = arguments[1:]
-
-
-@attr.s
-class CommandLine(Parser):
-    def interpret(self, args: typing.List[str] = sys.argv[1:]):
-        self.match(*args)
-        # run exclusive option
-        exclusive = next((o for o in self.options if o.exclusive), None)
-        if exclusive:
-            return {exclusive: exclusive.inject(self)}
-
-        return {option_cls: option_cls.inject(self) for option_cls in self.options}
-
-
-@attr.s
 class Group(Option):
     members: typing.Dict[str, GroupType] = {}
     parent: typing.Optional[GroupType] = None
@@ -403,14 +437,14 @@ class Group(Option):
             yield from member_cls._member_path(match)
 
     @classmethod
-    def inject(cls, match: Match):
-        if cls in match.values:
-            return match.values[cls]
-        path = list(cls._member_path(match))
+    def inject(cls, parser: Parser):
+        if cls in parser.values:
+            return parser.values[cls]
+        path = list(cls._member_path(parser))
         value = None
         while path:
             member_cls = path.pop(0)
-            value, parent_value = super(Group, member_cls).inject(match), value
+            value, parent_value = super(Group, member_cls).inject(parser), value
             value.parent = parent_value
         return value
 

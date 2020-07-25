@@ -236,7 +236,7 @@ def test_group(Commands, admin, create):
     )
 
 
-def test_help(Commands, admin, create):
+def _test_help(Commands, admin, create):
     from climate import options, CommandLine
 
     cl = CommandLine()
